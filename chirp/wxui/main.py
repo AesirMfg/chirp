@@ -52,6 +52,10 @@ from chirp.wxui import radioinfo
 from chirp.wxui import radiothread
 from chirp.wxui import report
 from chirp.wxui import settingsedit
+from chirp.wxui import sidebar
+from chirp.wxui import statusbar
+from chirp.wxui import theme
+from chirp.wxui import toolbar
 from chirp import CHIRP_VERSION
 
 EditorSetChanged, EVT_EDITORSET_CHANGED = wx.lib.newevent.NewCommandEvent()
@@ -279,6 +283,14 @@ class ChirpEditorSet(wx.Panel):
             editor = self._editors.GetPage(i)
             editor.update_font()
 
+    def apply_theme(self):
+        pal = theme.palette()
+        self.SetBackgroundColour(pal.window)
+        for _title, editor in self.iter_editors():
+            apply = getattr(editor, 'apply_theme', None)
+            if apply:
+                apply()
+
 
 class ChirpLiveEditorSet(ChirpEditorSet):
     MEMEDIT_CLS = memedit.ChirpLiveMemEdit
@@ -388,10 +400,10 @@ class ChirpMain(wx.Frame):
             chirp_platform.get_platform().set_last_dir(d)
 
         self.SetMenuBar(self.make_menubar())
-
-        # Stock items look good on linux, terrible on others,
-        # so punt on this for the moment.
-        # self.make_toolbar()
+        self._toolbar = toolbar.ChirpToolBar(self)
+        self._sidebar = sidebar.ChirpRadioSidebar(self)
+        self._filter_later = None
+        self._syncing_toolbar = False
 
         editor_style = (wx.aui.AUI_NB_CLOSE_ON_ALL_TABS |
                         wx.aui.AUI_NB_SCROLL_BUTTONS |
@@ -423,14 +435,21 @@ class ChirpMain(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self._window_close)
         self.Bind(common.EVT_CROSS_EDITOR_ACTION, self._editor_cross_action)
 
-        self.statusbar = self.CreateStatusBar(2)
-        self.statusbar.SetStatusWidths([-1, 200])
+        self.statusbar = statusbar.ChirpStatusBar(self)
+        if not CONF.get_bool('show_open_radios', 'state', True):
+            self._sidebar.Hide()
 
+        root = wx.BoxSizer(wx.VERTICAL)
+        body = wx.BoxSizer(wx.HORIZONTAL)
+        body.Add(self._sidebar, 0, wx.EXPAND)
+        body.Add(self._editors, 1, wx.EXPAND)
+        root.Add(self._toolbar, 0, wx.EXPAND)
+        root.Add(body, 1, wx.EXPAND)
+        root.Add(self.statusbar, 0, wx.EXPAND)
+        self.SetSizer(root)
+        self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_system_colour)
+        self.apply_theme()
         self._update_window_for_editor()
-
-        vbox = wx.BoxSizer()
-        self.SetSizer(vbox)
-        vbox.Add(self._editors, 1, flag=wx.EXPAND)
 
         self._tab_drop_panel = wx.Panel(self, style=wx.BORDER_SIMPLE)
         self._tab_drop_panel.SetBackgroundColour(wx.Colour(36, 67, 91))
@@ -615,6 +634,7 @@ class ChirpMain(wx.Frame):
             eset.Reparent(new._editors)
             new.add_editorset(eset)
             new.Show()
+            self._update_window_for_editor()
 
         menu = wx.Menu()
         detach = wx.MenuItem(menu, wx.ID_ANY, _('Open in new window'))
@@ -946,6 +966,14 @@ class ChirpMain(wx.Frame):
         self.Bind(wx.EVT_MENU, self._menu_restore_tabs, restore_tabs)
         restore_tabs.Check(CONF.get_bool('restore_tabs', 'prefs', False))
 
+        self._sidebar_item = wx.NewId()
+        sidebar_item = wx.MenuItem(view_menu, self._sidebar_item,
+                                   _('Show open radios'),
+                                   kind=wx.ITEM_CHECK)
+        view_menu.Append(sidebar_item)
+        self.Bind(wx.EVT_MENU, self._menu_sidebar, sidebar_item)
+        sidebar_item.Check(CONF.get_bool('show_open_radios', 'state', True))
+
         lang_item = wx.MenuItem(view_menu, wx.NewId(),
                                 _('Language') + '...')
         self.Bind(wx.EVT_MENU, self._menu_language, lang_item)
@@ -1159,26 +1187,163 @@ class ChirpMain(wx.Frame):
         else:
             p.print_preview(mems)
 
-    def make_toolbar(self):
-        tb = self.CreateToolBar()
+    def toolbar_open(self):
+        self._menu_open(None)
 
-        def bm(stock):
-            return wx.ArtProvider.GetBitmap(stock,
-                                            wx.ART_TOOLBAR, (32, 32))
+    def toolbar_save(self):
+        self._menu_save(None)
 
-        tbopen = tb.AddTool(wx.NewId(), _('Open'), bm(wx.ART_FILE_OPEN),
-                            _('Open a file'))
-        tb.AddTool(wx.NewId(), _('Save'), bm(wx.ART_FILE_SAVE),
-                   _('Save file'))
-        tb.AddTool(wx.NewId(), _('Close'), bm(wx.ART_CLOSE),
-                   _('Close file'))
-        tb.AddTool(wx.NewId(), _('Download'), bm(wx.ART_GO_DOWN),
-                   _('Download from radio'))
-        tb.AddTool(wx.NewId(), _('Upload'), bm(wx.ART_GO_UP),
-                   _('Upload to radio'))
+    def toolbar_import(self):
+        self._menu_import(None)
 
-        self.Bind(wx.EVT_MENU, self._menu_open, tbopen)
-        tb.Realize()
+    def toolbar_download(self):
+        self._menu_download(None)
+
+    def toolbar_upload(self):
+        self._menu_upload(None)
+
+    def toolbar_undo(self):
+        editor = self._focused_memedit()
+        if editor is not None and editor.can_undo:
+            editor._undo(None)
+
+    def toolbar_redo(self):
+        editor = self._focused_memedit()
+        if editor is not None and editor.can_redo:
+            editor._redo(None)
+
+    def on_memory_filter(self, text, immediate):
+        editor = self._focused_memedit()
+        if editor is None:
+            return
+        editor._filter_text = text or ''
+        if self._filter_later is not None:
+            self._filter_later.Stop()
+            self._filter_later = None
+        if immediate or not (text or '').strip():
+            editor.apply_filter(text)
+            return
+
+        def fire(value=text, target=editor):
+            if self._focused_memedit() is target:
+                target.apply_filter(value)
+
+        self._filter_later = wx.CallLater(200, fire)
+
+    def select_editor_page(self, index):
+        if 0 <= index < self._editors.GetPageCount():
+            self._editors.SetSelection(index)
+
+    def _menu_sidebar(self, event):
+        menuitem = event.GetEventObject().FindItemById(event.GetId())
+        shown = menuitem.IsChecked()
+        self._sidebar.Show(shown)
+        CONF.set_bool('show_open_radios', shown, 'state')
+        self.Layout()
+
+    def _on_system_colour(self, event):
+        self.apply_theme()
+        event.Skip()
+
+    def apply_theme(self):
+        pal = theme.palette()
+        self.SetBackgroundColour(pal.window)
+        self._toolbar.apply_theme()
+        self._sidebar.apply_theme()
+        self.statusbar.apply_theme()
+        self._editors.SetBackgroundColour(pal.window)
+        for i in range(self._editors.GetPageCount()):
+            page = self._editors.GetPage(i)
+            apply = getattr(page, 'apply_theme', None)
+            if apply:
+                apply()
+        self.Refresh()
+
+    def sync_toolbar_state(self):
+        if self._syncing_toolbar:
+            return
+        self._syncing_toolbar = True
+        try:
+            self._update_window_for_editor()
+        finally:
+            self._syncing_toolbar = False
+
+    def note_memory_stats(self):
+        self._update_status_fields()
+
+    def _focused_memedit(self):
+        eset = self.current_editorset
+        if eset is None:
+            return None
+        editor = eset.current_editor
+        if isinstance(editor, memedit.ChirpMemEdit):
+            return editor
+        return None
+
+    def _status_memedit(self):
+        focused = self._focused_memedit()
+        if focused is not None:
+            return focused
+        eset = self.current_editorset
+        if eset is None:
+            return None
+        for _title, editor in eset.iter_editors(onlycls=memedit.ChirpMemEdit):
+            return editor
+        return None
+
+    def _memory_count_label(self, editor):
+        if editor is None:
+            return ''
+        used, total = editor.memory_counts()
+        return _('%(used)d of %(total)d memories') % {
+            'used': used,
+            'total': total,
+        }
+
+    def _update_status_fields(self):
+        eset = self.current_editorset
+        if eset is None:
+            self.statusbar.set_radio('', '', '', False)
+            self.SetTitle('CHIRP')
+            return
+        radio = eset.radio
+        editor = self._status_memedit()
+        self.statusbar.set_radio(
+            '%s %s' % (radio.VENDOR, radio.MODEL),
+            sidebar.port_label(radio),
+            self._memory_count_label(editor),
+            sidebar.radio_connected(radio))
+        mark = '*' if eset.modified else ''
+        name = ('%s %s' % (radio.VENDOR, radio.MODEL)).strip()
+        if name:
+            self.SetTitle('CHIRP · %s%s' % (name, mark))
+        else:
+            self.SetTitle('CHIRP (%s)%s' % (
+                os.path.basename(eset.filename), mark))
+
+    def _toolbar_state(self, can_save, can_upload, can_edit, is_memedit):
+        editor = self._focused_memedit()
+        undo = bool(editor and editor.can_undo)
+        redo = bool(editor and editor.can_redo)
+        menu = self.GetMenuBar()
+        undo_help = _('Undo')
+        redo_help = _('Redo')
+        if menu is not None:
+            undo_item = menu.FindItemById(wx.ID_UNDO)
+            redo_item = menu.FindItemById(wx.ID_REDO)
+            if undo_item is not None:
+                undo_help = undo_item.GetItemLabelText() or undo_help
+            if redo_item is not None:
+                redo_help = redo_item.GetItemLabelText() or redo_help
+        return {
+            'save': can_save,
+            'upload': can_upload,
+            'import': bool(is_memedit and can_edit),
+            'undo': undo,
+            'redo': redo,
+            'undo_help': undo_help,
+            'redo_help': redo_help,
+        }
 
     def adj_menu_open_recent(self, filename):
         """Update the "open recent" menu
@@ -1249,7 +1414,7 @@ class ChirpMain(wx.Frame):
 
     def _editor_status(self, event):
         # FIXME: Should probably only do this for the current editorset
-        self.statusbar.SetStatusText(event.message)
+        self.statusbar.set_message(event.message)
 
     @common.error_proof()
     def _reload_editorset(self, event, editorset):
@@ -1356,16 +1521,17 @@ class ChirpMain(wx.Frame):
             is_memedit = isinstance(eset.current_editor, memedit.ChirpMemEdit)
             is_bank = isinstance(eset.current_editor, bankedit.ChirpBankEdit)
             can_edit = not is_network
-            self.SetTitle('CHIRP (%s)' % os.path.basename(eset.filename))
         else:
             self.SetTitle('CHIRP')
 
-        if self.current_editorset:
-            radio = self.current_editorset.radio
-            radio_name = '%s %s' % (radio.VENDOR, radio.MODEL)
-            self.statusbar.SetStatusText(radio_name, i=1)
-        else:
-            self.statusbar.SetStatusText('', i=1)
+        self._update_status_fields()
+        focused = self._focused_memedit()
+        self._toolbar.set_filter_enabled(focused is not None)
+        if focused is not None and not self._toolbar.filter_has_focus():
+            self._toolbar.set_filter_text(focused.filter_text)
+        self._toolbar.sync(self._toolbar_state(
+            can_save, can_upload, can_edit, is_memedit))
+        self._sidebar.refresh()
 
         items = [
             (wx.ID_CLOSE, can_close),
@@ -1453,6 +1619,8 @@ class ChirpMain(wx.Frame):
         self._editors.SetPageText(index, '%s%s' % (
             os.path.basename(editorset.filename),
             editorset.modified and '*' or ''))
+        if getattr(self, '_sidebar', None) is not None:
+            self._sidebar.refresh()
 
     def _menu_new(self, event):
         self.open_file('Untitled.csv', exists=False)
@@ -1581,6 +1749,7 @@ class ChirpMain(wx.Frame):
 
         editorset.save()
         self._update_editorset_title(self.current_editorset)
+        self._update_window_for_editor()
 
     @common.error_proof(errors.ImageDetectFailed, FileNotFoundError)
     def _menu_import(self, event):
