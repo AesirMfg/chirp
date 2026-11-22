@@ -32,3 +32,17 @@ class TestMemquery(base.BaseTest):
         self.assertEqual(3, len(filtered), filtered)
         self.assertEqual([145, 146, 800],
                          sorted([x.freq // 1000000 for x in filtered]))
+
+    def test_memories_matching_query(self):
+        matched = memquery.memories_matching_query(
+            'mode="FM" AND freq<144,147.1>', self._get_sample_memories())
+        self.assertEqual([145, 146],
+                         sorted(mem.freq // 1000000 for mem in matched))
+
+    def test_is_simple_filter(self):
+        self.assertTrue(memquery.is_simple_filter('repeater'))
+        self.assertTrue(memquery.is_simple_filter('146.52'))
+        self.assertFalse(memquery.is_simple_filter('name~"net"'))
+        self.assertFalse(memquery.is_simple_filter('freq<144,148>'))
+        self.assertFalse(
+            memquery.is_simple_filter('mode="FM" AND freq<144,148>'))

@@ -17,6 +17,7 @@ import contextlib
 import functools
 import itertools
 import logging
+import os
 import pickle
 import secrets
 import sys
@@ -39,6 +40,7 @@ from chirp.wxui import config
 from chirp.wxui import common
 from chirp.wxui import developer
 from chirp.wxui import memquery
+from chirp.wxui import theme
 
 _ = wx.GetTranslation
 LOG = logging.getLogger(__name__)
@@ -124,6 +126,8 @@ class ChirpRowLabelRenderer(glr.GridDefaultRowLabelRenderer):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.bgcolor = None
+        self.fill = None
+        self.text_colour = None
 
     def set_error(self):
         self.bgcolor = '#FF0000'
@@ -134,15 +138,61 @@ class ChirpRowLabelRenderer(glr.GridDefaultRowLabelRenderer):
     def clear_error(self):
         self.bgcolor = None
 
-    def Draw(self, grid, dc, rect, row):
+    def _row_selected(self, grid, row):
+        try:
+            return bool(grid.IsInSelection(row, 0))
+        except Exception:
+            return False
+
+    def _colours(self, grid, selected):
         if self.bgcolor:
-            dc.SetBrush(wx.Brush(self.bgcolor))
-            dc.SetPen(wx.TRANSPARENT_PEN)
-            dc.DrawRectangle(rect)
-        hAlign, vAlign = grid.GetRowLabelAlignment()
+            return wx.Colour(self.bgcolor), wx.Colour(0, 0, 0)
+        if selected:
+            return (grid.GetSelectionBackground(),
+                    grid.GetSelectionForeground())
+        background = self.fill or grid.GetLabelBackgroundColour()
+        foreground = self.text_colour or grid.GetLabelTextColour()
+        return background, foreground
+
+    def Draw(self, grid, dc, rect, row):
+        background, foreground = self._colours(
+            grid, self._row_selected(grid, row))
+        dc.SetBrush(wx.Brush(background))
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.DrawRectangle(rect)
+        dc.SetPen(wx.Pen(grid.GetGridLineColour()))
+        dc.DrawLine(rect.right - 1, rect.top, rect.right - 1, rect.bottom)
+        dc.DrawLine(rect.left, rect.bottom - 1, rect.right, rect.bottom - 1)
         text = grid.GetRowLabelValue(row)
-        self.DrawBorder(grid, dc, rect)
-        self.DrawText(grid, dc, rect, text, hAlign, vAlign)
+        dc.SetBackgroundMode(wx.TRANSPARENT)
+        dc.SetTextForeground(foreground)
+        dc.SetFont(grid.GetLabelFont())
+        tw, th = dc.GetTextExtent(text)
+        x = rect.x + max(0, (rect.width - tw) // 2)
+        y = rect.y + max(0, (rect.height - th) // 2)
+        dc.DrawText(text, x, y)
+
+
+class ChirpColLabelRenderer(glr.GridLabelRenderer):
+    def Draw(self, grid, dc, rect, col):
+        dc.SetBrush(wx.Brush(grid.GetLabelBackgroundColour()))
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.DrawRectangle(rect)
+        dc.SetPen(wx.Pen(grid.GetGridLineColour()))
+        dc.DrawLine(rect.left, rect.bottom - 1, rect.right, rect.bottom - 1)
+        text = grid.GetColLabelValue(col)
+        h_align, v_align = grid.GetColLabelAlignment()
+        self.DrawText(grid, dc, rect, text, h_align, v_align)
+
+
+class ChirpCornerLabelRenderer(glr.GridLabelRenderer):
+    def Draw(self, grid, dc, rect, row_or_col):
+        dc.SetBrush(wx.Brush(grid.GetLabelBackgroundColour()))
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.DrawRectangle(rect)
+        dc.SetPen(wx.Pen(grid.GetGridLineColour()))
+        dc.DrawLine(rect.left, rect.bottom - 1, rect.right, rect.bottom - 1)
+        dc.DrawLine(rect.right - 1, rect.top, rect.right - 1, rect.bottom)
 
 
 DEFAULT_COLUMN_HELP = {
@@ -427,12 +477,80 @@ class ChirpVariablePowerColumn(ChirpMemoryColumn):
     def _digest_value(self, memory, value):
         return chirp_common.parse_power(value)
 
+    def get_renderer(self):
+        return ChirpPillRenderer('power')
+
     @staticmethod
     def get_sortable_value(value):
         try:
             return int(chirp_common.parse_power(value))
         except ValueError:
             return 0
+
+
+class ChirpPillRenderer(wx.grid.GridCellRenderer):
+    """Rounded badge for short categorical values such as mode and power."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self._kind = kind
+
+    def Clone(self):
+        return ChirpPillRenderer(self._kind)
+
+    def _font(self, grid, attr):
+        font = attr.GetFont()
+        if font.IsOk():
+            return font
+        return grid.GetDefaultCellFont()
+
+    def GetBestSize(self, grid, attr, dc, row, col):
+        value = grid.GetCellValue(row, col) or 'FM'
+        dc.SetFont(self._font(grid, attr))
+        width, height = dc.GetTextExtent(value)
+        return wx.Size(width + 28, height + 16)
+
+    def Draw(self, grid, attr, dc, rect, row, col, isSelected):
+        dc.SetClippingRegion(rect)
+        try:
+            self._fill_cell(grid, dc, rect, row, col, isSelected)
+            value = grid.GetCellValue(row, col)
+            if value:
+                self._draw_pill(grid, attr, dc, rect, value)
+        finally:
+            dc.DestroyClippingRegion()
+
+    def _fill_cell(self, grid, dc, rect, row, col, isSelected):
+        if isSelected:
+            colour = grid.GetSelectionBackground()
+        else:
+            colour = grid.GetCellBackgroundColour(row, col)
+        dc.SetBrush(wx.Brush(colour))
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.DrawRectangle(rect)
+
+    def _draw_pill(self, grid, attr, dc, rect, value):
+        background, foreground = theme.pill_colours(self._kind, value)
+        dc.SetFont(self._font(grid, attr))
+        text_w, text_h = dc.GetTextExtent(value)
+        height = max(text_h + 4, min(rect.height - 8, text_h + 8))
+        width = text_w + 16
+        x = rect.x + 6
+        y = rect.y + max(0, (rect.height - height) // 2)
+        self._round_rect(dc, background, x, y, width, height, height // 2)
+        dc.SetTextForeground(foreground)
+        dc.DrawText(value, x + 8, y + (height - text_h) // 2)
+
+    def _round_rect(self, dc, colour, x, y, width, height, radius):
+        gc = wx.GraphicsContext.Create(dc)
+        if gc is None:
+            dc.SetBrush(wx.Brush(colour))
+            dc.SetPen(wx.TRANSPARENT_PEN)
+            dc.DrawRoundedRectangle(x, y, width, height, radius)
+            return
+        gc.SetBrush(wx.Brush(colour))
+        gc.SetPen(wx.Pen(colour))
+        gc.DrawRoundedRectangle(x, y, width, height, radius)
 
 
 class ChirpChoiceEditor(wx.grid.GridCellChoiceEditor):
@@ -472,6 +590,11 @@ class ChirpChoiceColumn(ChirpMemoryColumn):
 
     def get_editor(self):
         return ChirpChoiceEditor(self._str_choices)
+
+    def get_renderer(self):
+        if self._name in ('mode', 'power'):
+            return ChirpPillRenderer(self._name)
+        return None
 
     def get_propeditor(self, memory):
         current = self._render_value(memory, self.value(memory))
@@ -962,6 +1085,9 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
         self._undo_queue = []
         self._redo_queue = []
         self._undo_ctx = None
+        self._filter_text = ''
+        self._filter_rows = None
+        self._freq_font_cache = None
 
         self._col_defs = self._setup_columns()
 
@@ -976,18 +1102,18 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
         self._grid.DisableDragRowSize()
         self._grid.EnableDragCell()
         self._grid.SetFocus()
-        self._default_cell_bg_color = self._grid.GetCellBackgroundColour(0, 0)
+        self._grid.SetDefaultColLabelRenderer(ChirpColLabelRenderer())
+        self._grid.SetCornerLabelRenderer(ChirpCornerLabelRenderer())
+        self._grid.SetDefaultCellAlignment(wx.ALIGN_LEFT, wx.ALIGN_CENTER)
+        self._grid.SetRowLabelAlignment(wx.ALIGN_CENTRE, wx.ALIGN_CENTRE)
+        self._grid.SetColLabelAlignment(wx.ALIGN_LEFT, wx.ALIGN_CENTRE)
+        self._grid.SetDefaultRowSize(30, True)
+        self._grid.SetColLabelSize(44)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
-        if sys.platform != 'linux':
-            # FIXME: This doesn't work properly on Linux/GTK because the help
-            # window takes over focus from everything and has to be force quit.
-            self._filter_query = memquery.SearchBox(self,
-                                                    style=wx.TE_PROCESS_ENTER)
-            self._filter_query.Bind(wx.EVT_TEXT_ENTER, self._do_filter_query)
-            sizer.Add(self._filter_query, 0, wx.EXPAND | wx.ALL, border=5)
-        else:
-            self._filter_query = None
+        # Filtering lives in the main-window toolbar so every platform gets
+        # the same field. The old in-grid SearchBox popped a help window that
+        # stole focus on GTK.
         sizer.Add(self._grid, 1, wx.EXPAND)
         self.SetSizer(sizer)
 
@@ -1047,6 +1173,10 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
 
         workflow = menubar.FindItemById(TX_WORKFLOW_ID)
         workflow.Check(self._has_coldef('txfreq'))
+        parent = self.GetTopLevelParent()
+        sync = getattr(parent, 'sync_toolbar_state', None)
+        if sync is not None and parent is not self:
+            sync()
 
     @contextlib.contextmanager
     def undo_context(self, name, actiontype=MemeditUndoContext):
@@ -1103,50 +1233,97 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
     def is_sorted(self):
         return self._grid.GetSortingColumn() != wx.NOT_FOUND
 
+    @property
+    def can_undo(self):
+        return bool(self._undo_queue)
+
+    @property
+    def can_redo(self):
+        return bool(self._redo_queue)
+
+    @property
+    def filter_text(self):
+        return self._filter_text or ''
+
+    def memory_counts(self):
+        filled = 0
+        for memory in self._memory_cache.values():
+            if memory is not None and not memory.empty:
+                filled += 1
+        lower, upper = self._features.memory_bounds
+        specials = self._features.valid_special_chans or []
+        return filled, (upper - lower + 1 + len(specials))
+
+    def apply_filter(self, text):
+        """Show memories matching a toolbar search or query string."""
+        self._filter_text = text or ''
+        self._apply_active_filter()
+
     @common.error_proof()
     def _do_filter_query(self, event=None):
-        if not self._filter_query:
-            return
-        filter_str = self._filter_query.GetValue()
+        self._apply_active_filter()
 
-        if filter_str:
+    def _apply_active_filter(self):
+        text = (self._filter_text or '').strip()
+        if text and not memquery.is_simple_filter(text):
             try:
-                mems = self._filter_query.filter_memories(
-                    self._memory_cache.values())
-                rows_to_show = [self.mem2row(m.number)
-                                for m in mems if not m.empty]
-                LOG.debug('Filtering rows for query %r', filter_str)
-            except Exception as e:
-                if filter_str.isalnum():
-                    # Assume simple search string
-                    mems = rows_to_show = None
-                    LOG.debug('Filtering rows for search %r', filter_str)
-                else:
-                    LOG.exception('Parse error: %s', e)
-                    return
+                self._filter_rows = self._query_match_rows(text)
+            except Exception:
+                LOG.debug('Not applying invalid query %r', text, exc_info=True)
+                return
+        else:
+            self._filter_rows = None
+        self._apply_row_visibility()
 
-        num_rows = self._grid.GetNumberRows()
+    def _query_match_rows(self, text):
+        memories = [mem for mem in self._memory_cache.values()
+                    if mem is not None]
+        matched = memquery.memories_matching_query(text, memories)
+        return {self.mem2row(mem.number)
+                for mem in matched if not mem.empty}
+
+    def _simple_match(self, row, text):
+        needle = text.lower()
+        parts = []
+        for name in ('freq', 'name', 'comment'):
+            col = self._col_defs.index(self._col_def_by_name(name))
+            parts.append(self._grid.GetCellValue(row, col))
+        return needle in ''.join(parts).lower()
+
+    def _row_visible(self, row):
+        memory = self._memory_cache.get(row)
+        hide_empty = CONF.get_bool('hide_empty', 'memedit', False)
+        if memory is not None and memory.empty and hide_empty:
+            return False
+        text = (self._filter_text or '').strip()
+        if not text:
+            return True
+        if self._filter_rows is not None:
+            return row in self._filter_rows
+        return self._simple_match(row, text)
+
+    def _apply_row_visibility(self):
         visible = 0
-        for row in range(0, num_rows):
-            if not filter_str.strip():
-                show = True
-            elif mems is None:
-                # Simple search
-                buffer = ''.join(
-                    self._grid.GetCellValue(
-                        row,
-                        self._col_defs.index(self._col_def_by_name(x)))
-                    for x in ['freq', 'name', 'comment'])
-                show = filter_str.lower() in buffer.lower()
-            else:
-                show = row in rows_to_show
-            if show:
+        for row in range(self._grid.GetNumberRows()):
+            if self._row_visible(row):
                 self._grid.ShowRow(row)
                 visible += 1
             else:
                 self._grid.HideRow(row)
-        LOG.debug('Showing %i/%i rows', visible, num_rows)
-        self._filter_query.help.Hide()
+        LOG.debug('Showing %i rows for filter %r', visible, self._filter_text)
+
+    def _schedule_refilter(self):
+        if not (self._filter_text or '').strip():
+            return
+        if getattr(self, '_refilter_pending', False):
+            return
+        self._refilter_pending = True
+
+        def fire():
+            self._refilter_pending = False
+            self._apply_active_filter()
+
+        wx.CallLater(50, fire)
 
     def _keyboard_overrides(self, event):
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
@@ -1312,6 +1489,9 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
                 self._grid.SetColLabelValue(col, label)
                 attr = wx.grid.GridCellAttr()
                 attr.SetEditor(col_def.get_editor())
+                renderer = col_def.get_renderer()
+                if renderer is not None:
+                    attr.SetRenderer(renderer)
                 self._grid.SetColAttr(col, attr)
                 self._grid.SetColMinimalWidth(col, minwidth)
                 try:
@@ -1319,7 +1499,7 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
                 except AttributeError:
                     # No SetFitMode() support on wxPython 4.0.7
                     pass
-        wx.CallAfter(self._grid.AutoSizeColumns, setAsMin=False)
+        wx.CallAfter(self._finish_grid_layout)
 
     @classmethod
     def get_menu_items(cls):
@@ -1551,20 +1731,12 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
         if row in self._memory_errors:
             del self._memory_errors[row]
 
-        hide_empty = CONF.get_bool('hide_empty', 'memedit', False)
-        if memory.empty:
+        if memory.empty and self._has_coldef('duplex'):
             # Reset our "wants split" flags if the memory is empty
-            if self._has_coldef('duplex'):
-                offset_col = self._col_def_by_name('offset')
-                duplex_col = self._col_def_by_name('duplex')
-                offset_col.wants_split(memory, False)
-                duplex_col.wants_split(memory, False)
-            if hide_empty:
-                self._grid.HideRow(row)
-            else:
-                self._grid.ShowRow(row)
-        else:
-            self._grid.ShowRow(row)
+            offset_col = self._col_def_by_name('offset')
+            duplex_col = self._col_def_by_name('duplex')
+            offset_col.wants_split(memory, False)
+            duplex_col.wants_split(memory, False)
 
         if memory.extra:
             self._expand_extra(memory)
@@ -1575,39 +1747,151 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
                 LOG.debug('Driver refresh delta from set: %s', delta)
 
         self._memory_cache[row] = memory
-
-        try:
-            darkmode = wx.SystemSettings.GetAppearance().IsDark()
-        except AttributeError:
-            # Older wxPython doesn't have GetAppearance(), so just assume light
-            darkmode = False
-        if darkmode:
-            immutable_color = wx.SystemSettings.GetColour(
-                wx.SYS_COLOUR_GRAYTEXT)
-        else:
-            # This is a very light gray that looks good in light mode, but
-            # makes dark mode (light font) very hard to read.
-            immutable_color = (0xF5, 0xF5, 0xF5, 0xFF)
-
-        # Build a list of coldef names that are immutable extras for this
-        # memory
-        immutable_extras = ['extra.%s' % setting.get_name()
-                            for setting in memory.extra
-                            if not setting.value.get_mutable()]
         with wx.grid.GridUpdateLocker(self._grid):
             self.set_row_finished(row)
+            self._paint_memory_row(row, memory)
+        self._notify_memory_stats()
+        self._schedule_refilter()
 
-            for col, col_def in enumerate(self._col_defs):
-                self._grid.SetCellValue(row, col, col_def.render_value(memory))
-                immutable = (col_def.name in memory.immutable or
-                             col_def.name in immutable_extras)
-                self._grid.SetReadOnly(row, col,
-                                       immutable or not self.editable)
-                if immutable:
-                    color = immutable_color
-                else:
-                    color = self._default_cell_bg_color
-                self._grid.SetCellBackgroundColour(row, col, color)
+    def _frequency_font(self):
+        size = self._grid.GetDefaultCellFont().GetPointSize()
+        cached = self._freq_font_cache
+        if cached is not None and cached.GetPointSize() == size:
+            return cached
+        font = wx.Font(size, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL,
+                       wx.FONTWEIGHT_NORMAL)
+        self._freq_font_cache = font
+        return font
+
+    def _row_background(self, pal, row):
+        if row % 2:
+            return pal.zebra
+        return pal.window
+
+    def _immutable_names(self, memory):
+        names = ['extra.%s' % setting.get_name()
+                 for setting in memory.extra
+                 if not setting.value.get_mutable()]
+        names.extend(memory.immutable)
+        return set(names)
+
+    def _paint_memory_row(self, row, memory):
+        pal = theme.palette()
+        background = self._row_background(pal, row)
+        foreground = pal.muted if memory.empty else pal.text
+        label = self._row_label_renderers[row]
+        label.fill = background
+        label.text_colour = pal.muted if memory.empty else pal.text
+        immutable_names = self._immutable_names(memory)
+        freq_font = self._frequency_font()
+        for col, col_def in enumerate(self._col_defs):
+            self._grid.SetCellValue(row, col, col_def.render_value(memory))
+            immutable = col_def.name in immutable_names
+            self._grid.SetReadOnly(row, col, immutable or not self.editable)
+            if immutable and not memory.empty:
+                cell_bg = pal.immutable
+            else:
+                cell_bg = background
+            self._grid.SetCellBackgroundColour(row, col, cell_bg)
+            self._grid.SetCellTextColour(row, col, foreground)
+            if isinstance(col_def, ChirpFrequencyColumn):
+                self._grid.SetCellFont(row, col, freq_font)
+        self._reveal_row(row)
+
+    def _reveal_row(self, row):
+        if self._row_visible(row):
+            self._grid.ShowRow(row)
+        else:
+            self._grid.HideRow(row)
+
+    def _notify_memory_stats(self):
+        if getattr(self, '_stats_pending', False):
+            return
+        self._stats_pending = True
+
+        def fire():
+            self._stats_pending = False
+            self._push_memory_stats()
+
+        wx.CallLater(80, fire)
+
+    def _push_memory_stats(self):
+        window = self.GetTopLevelParent()
+        notify = getattr(window, 'note_memory_stats', None)
+        if notify is None or window is self:
+            return
+        current = getattr(window, 'current_editorset', None)
+        parent = self.GetParent()
+        editorset = parent.GetParent() if parent is not None else None
+        if current is None or editorset is not current:
+            return
+        notify()
+
+    def _apply_grid_chrome(self):
+        pal = theme.palette()
+        grid = self._grid
+        grid.SetDefaultCellBackgroundColour(pal.window)
+        grid.SetDefaultCellTextColour(pal.text)
+        grid.SetLabelBackgroundColour(pal.header)
+        grid.SetLabelTextColour(theme.blend(pal.muted, pal.text, 0.45))
+        grid.SetGridLineColour(pal.line)
+        grid.SetSelectionBackground(pal.selection)
+        grid.SetSelectionForeground(pal.selection_text)
+        try:
+            grid.SetCellHighlightColour(pal.accent)
+            grid.SetCellHighlightPenWidth(1)
+            grid.SetCellHighlightROPenWidth(1)
+        except Exception:
+            LOG.debug('Cell highlight styling is unavailable', exc_info=True)
+        label_font = wx.Font(grid.GetDefaultCellFont())
+        label_font.SetWeight(wx.FONTWEIGHT_NORMAL)
+        grid.SetLabelFont(label_font)
+        self.SetBackgroundColour(pal.window)
+        grid.SetBackgroundColour(pal.window)
+
+    def _finish_grid_layout(self):
+        self._grid.AutoSizeColumns(setAsMin=False)
+        large = CONF.get_bool('font_large', 'state', False)
+        self._grid.SetDefaultRowSize(36 if large else 30, True)
+        self._grid.SetColLabelSize(52 if large else 44)
+        self._grid.SetRowLabelSize(wx.grid.GRID_AUTOSIZE)
+        width = max(self._grid.GetRowLabelSize() + 8, 52)
+        self._grid.SetRowLabelSize(width)
+
+    def apply_theme(self):
+        self._freq_font_cache = None
+        self._apply_grid_chrome()
+        renderers = getattr(self, '_row_label_renderers', None)
+        if not renderers:
+            self._grid.ForceRefresh()
+            return
+        with wx.grid.GridUpdateLocker(self._grid):
+            for row, memory in list(self._memory_cache.items()):
+                if row in self._memory_errors:
+                    continue
+                if row >= len(renderers):
+                    continue
+                if not isinstance(memory, chirp_common.Memory):
+                    continue
+                self._paint_memory_row(row, memory)
+        self._grid.ForceRefresh()
+
+    def _screenshot_cue(self):
+        raw = os.environ.get('CHIRP_SCREENSHOT_MEMORY')
+        if not raw:
+            return
+        try:
+            number = int(raw)
+        except ValueError:
+            return
+
+        def show():
+            try:
+                self.cb_goto(number)
+            except Exception:
+                LOG.debug('Screenshot cue failed', exc_info=True)
+
+        wx.CallAfter(show)
 
     def synchronous_get_memory(self, number):
         """SYNCHRONOUSLY Get memory with extra properties
@@ -1765,6 +2049,9 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
             setlabel(row, i)
             row += 1
             self.refresh_memory(i, lazy=True)
+        self._apply_active_filter()
+        self._push_memory_stats()
+        self._screenshot_cue()
 
     def _set_memory_defaults(self, mem, *only):
         """This is responsible for setting sane default values on memories.
@@ -2437,15 +2724,17 @@ class ChirpMemEdit(common.ChirpEditor, common.ChirpSyncEditor):
             font = wx.Font(font)
             font.SetPointSize(font.PointSize + 2)
         self._grid.SetDefaultCellFont(font)
+        self._freq_font_cache = None
+        self._apply_grid_chrome()
         if refresh:
             self.refresh()
-        wx.CallAfter(self._grid.AutoSizeColumns, setAsMin=False)
-        wx.CallAfter(self._grid.AutoSizeRows, setAsMin=False)
-        wx.CallAfter(self._grid.SetRowLabelSize, wx.grid.GRID_AUTOSIZE)
+        wx.CallAfter(self._finish_grid_layout)
 
     def selected(self):
         self._grid.SetFocus()
         self._update_menu()
+        if (self._filter_text or '').strip():
+            self._apply_active_filter()
 
     def cb_copy_getdata(self, cut=False, portable=False):
         rows = self.get_selected_rows_safe()

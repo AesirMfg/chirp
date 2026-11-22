@@ -131,6 +131,35 @@ class Interpreter(lark.Transformer):
         return items[0]
 
 
+_QUERY_PARSER = None
+_QUERY_MARKERS = ('=', '~', '<', '>', '[', ']', '(', ')')
+
+
+def is_simple_filter(text):
+    """True when text is a plain search rather than a query expression."""
+    if any(mark in text for mark in _QUERY_MARKERS):
+        return False
+    padded = ' %s ' % text.lower()
+    if ' and ' in padded or ' or ' in padded:
+        return False
+    return True
+
+
+def memories_matching_query(text, memories):
+    """Return the memories matched by a CHIRP query string."""
+    global _QUERY_PARSER
+    if _QUERY_PARSER is None:
+        _QUERY_PARSER = lark.Lark(LANG)
+    query = _QUERY_PARSER.parse(text)
+    result = Interpreter(list(memories)).transform(query)
+    if isinstance(result, list):
+        return result
+    children = getattr(result, 'children', None)
+    if children:
+        return children[0]
+    return result
+
+
 class QueryFilterError(SyntaxError):
     pass
 

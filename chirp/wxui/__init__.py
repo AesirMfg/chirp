@@ -147,7 +147,9 @@ def chirpmain():
     # This must be imported before wx.App() to squelch warnings on startup
     # about duplicate "Windows bitmap file" handlers
     import wx.richtext
+    from chirp.wxui import theme
     app = wx.App()
+    theme.install(app)
     if args.force_language:
         force_lang = wx.Locale.FindLanguageInfo(args.force_language)
         if force_lang is None:
